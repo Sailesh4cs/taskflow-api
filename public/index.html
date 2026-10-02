@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskFlow Dashboard</title>
+<style nonce="{{NONCE}}">
+  :root { --bg:#0f172a; --panel:#1e293b; --muted:#94a3b8; --text:#e2e8f0; --accent:#38bdf8; --bad:#f87171; --ok:#4ade80; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid #334155; display:flex; justify-content:space-between; align-items:center; }
+  h1 { margin:0; font-size:20px; } h2 { font-size:15px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  main { padding:20px 24px; display:grid; gap:20px; max-width:1200px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; }
+  .card, section { background:var(--panel); border-radius:10px; padding:14px 16px; }
+  .card .v { font-size:24px; font-weight:700; } .card .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .bars { display:grid; gap:6px; } .bar { display:grid; grid-template-columns:100px 1fr 40px; align-items:center; gap:8px; }
+  .track { background:#0f172a; border-radius:4px; height:12px; overflow:hidden; } .fill { background:var(--accent); height:100%; }
+  form, .filters { display:flex; flex-wrap:wrap; gap:8px; align-items:end; }
+  label { display:grid; gap:3px; font-size:12px; color:var(--muted); }
+  input, select, button { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid #475569; background:#0f172a; color:var(--text); }
+  button { cursor:pointer; background:#0369a1; border-color:#0369a1; } button.secondary { background:transparent; } button.danger { background:transparent; border-color:var(--bad); color:var(--bad); }
+  table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #334155; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; background:#334155; margin:1px 2px 1px 0; }
+  .s-done { background:#14532d; } .s-blocked { background:#7f1d1d; } .s-in_progress { background:#1e3a8a; }
+  .p-high { color:var(--bad); } .p-low { color:var(--muted); } .overdue { color:var(--warn); font-weight:600; }
+  .actions { display:flex; gap:4px; flex-wrap:wrap; } .actions button { padding:2px 8px; font-size:12px; }
+  #msg { min-height:20px; } #msg.err { color:var(--bad); } #msg.ok { color:var(--ok); }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<header><h1>TaskFlow</h1><span class="muted" id="health">checking…</span></header>
+<main>
+  <div class="cards" id="cards"></div>
+  <section><h2>Status distribution</h2><div class="bars" id="bars"></div></section>
+  <section>
+    <h2>New task</h2>
+    <form id="create">
+      <label>Title<input name="title" required maxlength="200" size="30"></label>
+      <label>Priority<select name="priority"><option>medium</option><option>high</option><option>low</option></select></label>
+      <label>Assignee<input name="assignee" maxlength="100"></label>
+      <label>Due<input name="dueDate" type="date"></label>
+      <label>Tags (comma)<input name="tags" placeholder="api, backend"></label>
+      <button type="submit">Create</button>
+    </form>
+    <div id="msg" role="status"></div>
+  </section>
+  <section>
+    <h2>Tasks</h2>
+    <div class="filters">
+      <label>Status<select id="f-status"><option value="">any</option></select></label>
+      <label>Priority<select id="f-priority"><option value="">any</option></select></label>
+      <label>Search<input id="f-q" maxlength="100"></label>
+      <label>Overdue<select id="f-overdue"><option value="">any</option><option value="true">yes</option><option value="false">no</option></select></label>
+      <label>Sort<select id="f-sort"><option value="-createdAt">newest</option><option value="dueDate">due date</option><option value="priority">priority</option><option value="title">title</option></select></label>
+      <button class="secondary" id="refresh" type="button">Refresh</button>
+    </div>
+    <table><thead><tr><th>Title</th><th>Status</th><th>Priority</th><th>Assignee</th><th>Due</th><th>Tags</th><th>Actions</th></tr></thead><tbody id="rows"></tbody></table>
+    <p class="muted" id="count"></p>
+  </section>
+</main>
+<script nonce="{{NONCE}}">
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, children = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "text") node.textContent = v; else if (k === "class") node.className = v; else if (k.startsWith("on")) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v);
+  }
+  for (const c of children) node.append(c);
+  return node;
+};
+let meta = { statuses: [], priorities: [], transitions: {} };
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { ...options, headers: options.body ? { "Content-Type": "application/json" } : {} });
+  if (res.status === 204) return null;
+  const body = await res.json();
+  if (!res.ok) {
+    const details = Array.isArray(body.error.details) ? body.error.details.map((d) => `${d.field}: ${d.message}`).join("; ") : "";
+    throw new Error(body.error.message + (details ? ` (${details})` : ""));
+  }
+  return body;
+}
+function flash(text, ok) { const m = $("msg"); m.textContent = text; m.className = ok ? "ok" : "err"; }
+
+async function loadMetrics() {
+  const { data } = await api("/api/metrics");
+  const cards = [["Total", data.total], ["Done", data.byStatus.done], ["In progress", data.byStatus.in_progress], ["Blocked", data.byStatus.blocked],
+    ["Overdue", data.overdue], ["Due ≤7d", data.dueNext7Days], ["Completion", Math.round(data.completionRate * 100) + "%"], ["Avg cycle (h)", data.avgCycleTimeHours ?? "–"]];
+  $("cards").replaceChildren(...cards.map(([l, v]) => el("div", { class: "card" }, [el("div", { class: "v", text: String(v) }), el("div", { class: "l", text: l })])));
+  const max = Math.max(1, ...Object.values(data.byStatus));
+  $("bars").replaceChildren(...Object.entries(data.byStatus).map(([s, n]) => {
+    const fill = el("div", { class: "fill" }); fill.style.width = (n / max * 100) + "%";
+    return el("div", { class: "bar" }, [el("span", { text: s }), el("div", { class: "track" }, [fill]), el("span", { text: String(n) })]);
+  }));
+}
+
+async function loadTasks() {
+  const p = new URLSearchParams();
+  for (const [id, key] of [["f-status", "status"], ["f-priority", "priority"], ["f-q", "q"], ["f-overdue", "overdue"], ["f-sort", "sort"]]) if ($(id).value) p.set(key, $(id).value);
+  p.set("limit", "100");
+  const { data, page } = await api("/api/tasks?" + p);
+  $("rows").replaceChildren(...data.map((t) => {
+    const actions = el("div", { class: "actions" }, [
+      ...meta.transitions[t.status].map((to) => el("button", { type: "button", class: "secondary", text: "→ " + to, onclick: () => update(t, { status: to }) })),
+      el("button", { type: "button", class: "danger", text: "Delete", onclick: () => remove(t) }),
+    ]);
+    return el("tr", {}, [
+      el("td", { text: t.title, title: t.description }),
+      el("td", {}, [el("span", { class: "pill s-" + t.status, text: t.status })]),
+      el("td", { class: "p-" + t.priority, text: t.priority }),
+      el("td", { text: t.assignee || "—" }),
+      el("td", { class: t.overdue ? "overdue" : "", text: (t.dueDate || "—") + (t.overdue ? " (overdue)" : "") }),
+      el("td", {}, t.tags.map((tag) => el("span", { class: "pill", text: tag }))),
+      el("td", {}, [actions]),
+    ]);
+  }));
+  $("count").textContent = `Showing ${data.length} of ${page.total}`;
+}
+
+async function refresh() {
+  try { await Promise.all([loadMetrics(), loadTasks()]); } catch (e) { flash(e.message, false); }
+}
+async function update(task, patch) {
+  try {
+    const res = await fetch(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json", "If-Match": `"${task.version}"` }, body: JSON.stringify(patch) });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error.message);
+    flash(`Moved “${task.title}” to ${patch.status}`, true);
+  } catch (e) { flash(e.message, false); }
+  refresh();
+}
+async function remove(task) {
+  if (!confirm(`Delete “${task.title}”?`)) return;
+  try { await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" }); flash("Deleted", true); } catch (e) { flash(e.message, false); }
+  refresh();
+}
+
+$("create").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const body = { title: f.get("title"), priority: f.get("priority") };
+  if (f.get("assignee").trim()) body.assignee = f.get("assignee");
+  if (f.get("dueDate")) body.dueDate = f.get("dueDate");
+  const tags = f.get("tags").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (tags.length) body.tags = tags;
+  try { await api("/api/tasks", { method: "POST", body: JSON.stringify(body) }); ev.target.reset(); flash("Task created", true); } catch (e) { flash(e.message, false); }
+  refresh();
+});
+for (const id of ["f-status", "f-priority", "f-overdue", "f-sort"]) $(id).addEventListener("change", loadTasks);
+$("f-q").addEventListener("input", () => { clearTimeout(window.qt); window.qt = setTimeout(loadTasks, 250); });
+$("refresh").addEventListener("click", refresh);
+
+(async () => {
+  try {
+    meta = (await api("/api/meta")).data;
+    for (const s of meta.statuses) $("f-status").append(el("option", { value: s, text: s }));
+    for (const p of meta.priorities) $("f-priority").append(el("option", { value: p, text: p }));
+    const h = await api("/health"); $("health").textContent = "API " + h.status;
+  } catch (e) { $("health").textContent = "API unreachable"; }
+  refresh();
+})();
+</script>
+</body>
+</html>
